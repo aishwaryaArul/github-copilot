@@ -5,14 +5,52 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from collections.abc import Generator
+from typing import Annotated
+
+from fastapi import FastAPI, Header, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from sqlalchemy.orm import Session
+
+from src.database import Database
+from src.models import Project
+from src.schemas import ProjectCreate, ProjectResponse, ProjectStatusUpdate
+from src.schemas_core import (
+    AuditLogCreate,
+    AuditLogResponse,
+    NotificationCreate,
+    NotificationResponse,
+)
+from src.services.core_service import CoreService, CoreValidationError
+from src.services.project_service import (
+    ProjectNotFoundError,
+    ProjectService,
+    ProjectValidationError,
+)
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+database = Database()
+project_service = ProjectService()
+core_service = CoreService()
+
+
+def get_database_session() -> Generator[Session, None, None]:
+    session = database.session()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def get_tenant_id(tenant_id: Annotated[str, Header(alias="X-Tenant-ID")]) -> str:
+    clean_tenant_id = tenant_id.strip()
+    if not clean_tenant_id or len(clean_tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+    return clean_tenant_id
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -124,3 +162,132 @@ def unregister_from_activity(activity_name: str, email: str):
 
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+@app.post("/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+def create_project(
+    payload: ProjectCreate,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> Project:
+    try:
+        return project_service.create_project(
+            session, tenant_id, payload.name, payload.team, payload.status
+        )
+    except ProjectValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.patch("/projects/{project_id}/status", response_model=ProjectResponse)
+def update_project_status(
+    project_id: int,
+    payload: ProjectStatusUpdate,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> Project:
+    try:
+        return project_service.update_project_status(session, tenant_id, project_id, payload.status)
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Project not found") from error
+
+
+@app.get("/projects", response_model=list[ProjectResponse])
+def get_projects_by_team(
+    team: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> list[Project]:
+    try:
+        return project_service.get_projects_by_team(session, tenant_id, team)
+    except ProjectValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(
+    project_id: int,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> None:
+    try:
+        project_service.delete_project(session, tenant_id, project_id)
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Project not found") from error
+
+
+@app.post("/audit-logs", response_model=AuditLogResponse, status_code=status.HTTP_201_CREATED)
+def record_audit_log(
+    payload: AuditLogCreate,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> AuditLogResponse:
+    try:
+        return core_service.record_audit(
+            session,
+            tenant_id,
+            payload.actor_id,
+            payload.action,
+            payload.resource_type,
+            payload.resource_id,
+            payload.details,
+        )
+    except CoreValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.get("/audit-logs", response_model=list[AuditLogResponse])
+def get_audit_logs(
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+    limit: int = 100,
+) -> list[AuditLogResponse]:
+    try:
+        return core_service.get_audit_logs(session, tenant_id, limit)
+    except CoreValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/notifications", response_model=NotificationResponse, status_code=status.HTTP_201_CREATED)
+def create_notification(
+    payload: NotificationCreate,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> NotificationResponse:
+    try:
+        return core_service.create_notification(
+            session,
+            tenant_id,
+            payload.recipient_id,
+            payload.notification_type,
+            payload.message,
+        )
+    except CoreValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.get("/notifications", response_model=list[NotificationResponse])
+def get_notifications(
+    recipient_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+    limit: int = 100,
+) -> list[NotificationResponse]:
+    try:
+        return core_service.get_notifications(session, tenant_id, recipient_id, limit)
+    except CoreValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.patch("/notifications/{notification_id}/read", response_model=NotificationResponse)
+def mark_notification_read(
+    notification_id: int,
+    recipient_id: str,
+    tenant_id: Annotated[str, Depends(get_tenant_id)],
+    session: Annotated[Session, Depends(get_database_session)],
+) -> NotificationResponse:
+    try:
+        return core_service.mark_notification_read(
+            session, tenant_id, recipient_id, notification_id
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="Notification not found") from error
